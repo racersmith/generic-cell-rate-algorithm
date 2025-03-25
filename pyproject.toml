@@ -1,0 +1,34 @@
+[project]
+name = "generic-cell-rate-algorithm"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Josh Smith",email = "racersmith@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pytest (>=8.3.4,<9.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.test]
+optional = true
+
+[tool.poetry.group.test.dependencies]
+pytest = "^8.3.4"
+coverage = "^7.6.12"
+
+
+[tool.poe.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+jupyter = "^1.1.1"
+matplotlib = "^3.10.1"
+numpy = "^2.2.4"
+
