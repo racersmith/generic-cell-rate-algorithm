@@ -1,313 +1,323 @@
-import pytest
+from contextlib import AbstractContextManager
+from typing import List
+from collections import namedtuple
 
-from typing import Callable, List
-import datetime
-import numpy as np
+from multiprocessing import Lock
 
 from generic_cell_rate_algorithm import throttle
+from generic_cell_rate_algorithm.util import calculate_two_point_rate
 
+import pytest
 
-class TimeWarp:
+class TimeWarp(throttle.Time):
     def __init__(self):
         self.clock = 0.0
 
-    def now(self) -> float:
+    def time(self) -> float:
         return self.clock
 
-    def sleep(self, seconds) -> None:
+    def sleep(self, seconds: float) -> None:
+        if seconds < 0:
+            raise ValueError("negative sleep time not allowed")
         self.clock += seconds
 
 
-class TATStore(throttle.TatStoreProtocol):
-    def __init__(self, rate_limit: throttle.RateLimit, now: Callable):
-        self.tat = 0
+class RateLimitInterface(throttle.RateLimitIO):
+    def __init__(self):
 
-        self.rate_limit = rate_limit
-        self.now = now
+        rate = calculate_two_point_rate(short_count=600, short_period=15*60, long_count=6000, long_period=24*60*60)
 
-    def _get(self):
-        return self.tat
+        self.rate_limit = throttle.RateLimit(rate.count, rate.period)
 
-    def _set(self, tat):
-        self.tat = tat
-
-    def _now(self):
-        return self.now()
-
-    def update(self, *args, **kwargs):
-        tat_update = throttle.update_tat(self._now(), self._get(), self.rate_limit)
-        self._set(tat_update.new_tat)
-        return tat_update.wait_time
+    def read(self) -> throttle.RateLimit:
+        return self.rate_limit
 
 
-class PriorityTATStore(throttle.TatStoreProtocol):
-    def __init__(self, rate_limits: List[throttle.RateLimit], now: Callable):
-        self.tats = [[0.0, rate_limit, 0] for rate_limit in rate_limits]
-        self.now = now
-
-    def _get(self, level:int=0):
-        tats = self.tats[:level+1]
-        i = np.argmin([tat[0] for tat in tats]).ravel()[0]
-
-        return i, self.tats[i][0], self.tats[i][1]
-
-    def _set(self, i, new_tat):
-        self.tats[i][0] = new_tat
-        self.tats[i][2] += 1
-
-    def _now(self):
-        return self.now()
-
-    def update(self, level: int=0):
-        i, tat, ratelimit = self._get(level)
-        tat_update = throttle.update_tat(self._now(), tat, ratelimit)
-        self._set(i, tat_update.new_tat)
-        return tat_update.wait_time
+throttle_state_row = namedtuple("throttle_state_row", ["id", "level", "tat", "allocation"])
 
 
-class TestPriorityTATStore:
-    def test_levels(self):
-        rate_limits = [
-            throttle.RateLimit(10, 60),
-            throttle.RateLimit(5, 100)
+class ThrottleStateInterface(throttle.ThrottleStateIO):
+    def __init__(self, throttle_state_list: List[throttle_state_row]):
+        self._db = {state.id: state for state in throttle_state_list}
+
+    def read(self) -> List[throttle.ThrottleState]:
+        result = list()
+        for row in self._db.values():
+            throttle_state = throttle.ThrottleState(row.tat, row.level, row.allocation, id=row.id)
+            result.append(throttle_state)
+
+        return result
+
+    def write(self, previous: throttle.ThrottleState, new: throttle.ThrottleState):
+        self._db[previous.id] = throttle_state_row(**new.__dict__)
+
+    def transaction_context(self) -> AbstractContextManager:
+        return Lock()
+
+
+
+def test_rate_limit_inverse():
+    rate_limit = throttle.RateLimit(count=12, period=23)
+    assert abs(rate_limit.inverse - 23/12) < 1/throttle.TIME_RESOLUTION
+
+
+
+def test_throttle_state():
+    a = throttle.ThrottleState(level=0, tat=123)
+    b = throttle.ThrottleState(level=1, tat=111)
+    assert b < a
+
+
+
+class TestThrottleStateInterface:
+    def test_read(self):
+        throttle_states = [
+            throttle_state_row(1234, 0, 0, 1),
+            throttle_state_row(2345, 1, 0, 1),
+            throttle_state_row(3456, 2, 0, 1),
         ]
-        timewarp = TimeWarp()
-        store = PriorityTATStore(rate_limits=rate_limits, now=timewarp.now)
-
-        store.tats[0][0] = 60
-
-        i, tat, ratelimit = store._get(level=0)
-        assert i == 0
-        assert tat == 60
-        assert ratelimit == rate_limits[0]
-        store._set(i, 75)
-        assert store.tats[i][2] == 1
-        i, tat, ratelimit = store._get(level=0)
-        assert tat == 75
-
-        i, tat, ratelimit = store._get(level=1)
-        assert i == 1
-        assert tat == 0
-        assert ratelimit == rate_limits[1]
-        store._set(i, 90)
-        assert store.tats[i][2] == 1
-        i, tat, ratelimit = store._get(level=1)
-        assert tat == 75
+        throttle_state_io = ThrottleStateInterface(throttle_states)
+        result = throttle_state_io.read()
+        assert len(result) == len(throttle_states)
+        for state in result:
+            assert state.__dict__ == throttle_state_io._db[state.id]._asdict()
 
 
-class TestTwoPoint:
-    n_s, n_l = 10, 100
-    p_s, p_l = datetime.timedelta(seconds=10), datetime.timedelta(seconds=1000)
-
-    def test_error(self):
-        with pytest.raises(ValueError):
-            throttle.create_two_point_rate_limit(self.n_l, self.p_s, self.n_s, self.p_l)
-
-        with pytest.raises(ValueError):
-            throttle.create_two_point_rate_limit(self.n_s, self.p_l, self.n_l, self.p_s)
-
-    def test_normal(self):
-        rate_limit = throttle.create_two_point_rate_limit(self.n_s, self.p_s, self.n_l, self.p_l)
-        assert rate_limit.count > 0
-        assert rate_limit.period_seconds > 0
-
-    def test_short(self):
-        # force a condition where no burst is allowed
-        rate_limit = throttle.create_two_point_rate_limit(self.n_s, self.p_s, 1000 * self.n_l, self.p_l)
-        assert rate_limit.count == 1
-        assert rate_limit.period_seconds > 0
+    def test_write(self):
+        throttle_states = [
+            throttle_state_row(1234, 0, 0, 1),
+            throttle_state_row(2345, 1, 0, 1),
+            throttle_state_row(3456, 2, 0, 1),
+        ]
+        throttle_state_io = ThrottleStateInterface(throttle_states)
+        result = throttle_state_io.read()
+        state = result[1]
+        new_state = state._new(99)
+        throttle_state_io.write(state, new_state)
+        assert throttle_state_io._db[state.id]._asdict() == new_state.__dict__
 
 
-class TestThrottle:
-    def test_simple(self):
-        n = 10
-        period = 60
+class TestGcraMethods:
+    def __init__(self):
+        rate_limit_io = RateLimitInterface()
 
-        rate_limit = throttle.RateLimit(n, datetime.timedelta(seconds=period).total_seconds())
+        throttle_states = [throttle_state_row(0, 0, 0, 1)]
+        throttle_state_io = ThrottleStateInterface(throttle_states)
 
-        time_warp = TimeWarp()
-        tat_store = TATStore(rate_limit=rate_limit, now=time_warp.now)
-        gcra = throttle.GCRA(tat_store=tat_store, sleep_fn=time_warp.sleep)
+        time = TimeWarp()
 
-        @gcra.throttle()
-        def fn(i):
-            i += 1
-            return i
+        self.gcra = throttle.GCRA(rate_limit_io, throttle_state_io, time)
 
-        count = 0
-        start_time = time_warp.now()
-        for _ in range(n):
-            count = fn(count)
-        end_time = time_warp.now()
-        assert end_time - start_time == 0, f"Burst should not be limited. wait={end_time - start_time}"
+    def test_filter(self):
+        states = [
+            throttle_state_row(level=0, tat=1, allocation=1, id=0),
+            throttle_state_row(level=1, tat=3, allocation=1, id=1),
+            throttle_state_row(level=2, tat=2, allocation=1, id=2),
+            throttle_state_row(level=3, tat=0, allocation=1, id=3)
 
-        # start_time = time_warp.now()
-        for i in range(1000*n):
-            count = fn(count)
-
-        end_time = time_warp.now()
-        rate = count/(end_time - start_time)
-        expected_rate = 1/rate_limit.inverse
-        rate_limit_error = (rate - expected_rate)/expected_rate
-        assert rate_limit_error < 0.01, f"Try and be conservative on the error"
-
-    def test_two_point(self):
-        n_s = 300
-        period_s = datetime.timedelta(minutes=15)
-        n_l = 3000
-        period_l = datetime.timedelta(hours=24)
-
-        rate_limit = throttle.create_two_point_rate_limit(n_s, period_s, n_l, period_l)
-
-        time_warp = TimeWarp()
-        tat_store = TATStore(rate_limit=rate_limit, now=time_warp.now)
-        gcra = throttle.GCRA(tat_store=tat_store, sleep_fn=time_warp.sleep)
-
-        @gcra.throttle()
-        def fn(i):
-            i += 1
-            return i
-
-        count = 0
-
-        # Check the burst limit in the short period
-        while time_warp.now() < period_s.total_seconds():
-            count = fn(count)
-
-        assert count <= n_s, f"We want throttle to be conservative, {count} <= {n_s}"
-        assert (n_s - count) / n_s <= 0.1, f"Good enough for me is within 1% of the target count"
-        assert time_warp.now() >= period_s.total_seconds()
-
-        # Check the combined burst and throttled calls adhere to the long period
-        while time_warp.now() < period_l.total_seconds():
-            count = fn(count)
-        assert count <= n_l, f"We want throttle to be conservative, {count} <= {n_l}"
-        assert (n_l - count)/n_l <= 0.1, f"Good enough for me is within 1% of the target count"
-        assert time_warp.now() >= period_l.total_seconds()
-
-    def test_priority_default(self):
-        n_s = 300
-        period_s = datetime.timedelta(minutes=15)
-        n_l = 3000
-        period_l = datetime.timedelta(hours=24)
-
-        rate_limit = throttle.create_two_point_rate_limit(n_s, period_s, n_l, period_l)
-
-        time_warp = TimeWarp()
-        tat_store = PriorityTATStore(rate_limits=[rate_limit], now=time_warp.now)
-        gcra = throttle.GCRA(tat_store=tat_store, sleep_fn=time_warp.sleep)
-
-        @gcra.throttle()
-        def fn(i):
-            i += 1
-            return i
-
-        count = 0
-
-        # Check the burst limit in the short period
-        while time_warp.now() < period_s.total_seconds():
-            count = fn(count)
-
-        assert count <= n_s, f"We want throttle to be conservative, {count} <= {n_s}"
-        assert (n_s - count) / n_s <= 0.1, f"Good enough for me is within 1% of the target count"
-        assert time_warp.now() >= period_s.total_seconds()
-
-        # Check the combined burst and throttled calls adhere to the long period
-        while time_warp.now() < period_l.total_seconds():
-            count = fn(count)
-        assert count <= n_l, f"We want throttle to be conservative, {count} <= {n_l}"
-        assert (n_l - count)/n_l <= 0.1, f"Good enough for me is within 1% of the target count"
-        assert time_warp.now() >= period_l.total_seconds()
-
-    def test_priority(self):
-        rate_limits = [
-            throttle.RateLimit(1, datetime.timedelta(minutes=15).total_seconds()),
-            throttle.RateLimit(1, datetime.timedelta(minutes=15).total_seconds()),
         ]
 
-        time_warp = TimeWarp()
-        tat_store = PriorityTATStore(rate_limits=rate_limits, now=time_warp.now)
-        gcra = throttle.GCRA(tat_store=tat_store, sleep_fn=time_warp.sleep)
+        assert self.gcra._filter_throttle_states(states, 0) == states[0]
+        assert self.gcra._filter_throttle_states(states, 1) == states[0]
+        assert self.gcra._filter_throttle_states(states, 2) == states[2]
+        assert self.gcra._filter_throttle_states(states, 3) == states[3]
 
-        @gcra.throttle(level=0)
-        def fn(i):
-            i += 1
-            return i
+    def test_sum(self):
+        states = [
+            throttle_state_row(level=0, tat=1, allocation=1, id=0),
+        ]
+        assert self.gcra._sum_allocations(states) == 1
 
-        count = 0
+        states = [
+            throttle_state_row(level=0, tat=1, allocation=1, id=0),
+            throttle_state_row(level=1, tat=3, allocation=10, id=1),
+            throttle_state_row(level=2, tat=2, allocation=3, id=2),
+            throttle_state_row(level=3, tat=0, allocation=1, id=3)
 
-        def fn2(i):
-            i += 1
-            return i
+        ]
+        assert self.gcra._sum_allocations(states) == 15
 
-        n_fn = 0
-        n_fn2 = 0
+    def test_calculate_rate_limit(self):
+        state = throttle_state_row(level=3, tat=0, allocation=100, id=3)
+        rate_limit = throttle.RateLimit(count=333, period=10)
 
-        fn_sleep = list()
-        fn2_sleep = list()
+        assert self.gcra._calculate_rate_limit(rate_limit, state, total_allocation=1) == 333
+        assert self.gcra._calculate_rate_limit(rate_limit, state, total_allocation=10) == 333
+        assert self.gcra._calculate_rate_limit(rate_limit, state, total_allocation=200) == 166
+        assert self.gcra._calculate_rate_limit(rate_limit, state, total_allocation=300) == 111
+        assert self.gcra._calculate_rate_limit(rate_limit, state, total_allocation=1e9) == 1
 
-        for i_calls in range(1000):
-            t0 = time_warp.now()
-            n_fn = fn(n_fn)
-            t1 = time_warp.now()
-            fn_sleep.append(t1 - t0)
-            with gcra.throttle(level=1):
-                t0 = time_warp.now()
-                n_fn2 = fn2(n_fn2)
-                t1 = time_warp.now()
-                fn2_sleep.append(t1 - t0)
+    def test_calculate_next_tat(self):
+        rate_limit = throttle.RateLimit(count=1, period=10)
 
-        assert tat_store.tats[0][0] > 0
-        assert tat_store.tats[1][0] > 0
-        assert np.mean(fn2_sleep) < np.mean(fn_sleep)
+        now = 10
+        state = throttle.ThrottleState(level=3, tat=now)
+        assert self.gcra._calculate_next_tat(now, state, rate_limit) == now + rate_limit.inverse
 
-        level_0_rate = (tat_store.tats[0][2] - 1)/time_warp.now()
-        assert level_0_rate <= tat_store.tats[0][1].count/tat_store.tats[0][1].period_seconds
-        level_1_rate = (tat_store.tats[1][2] - 1)/time_warp.now()
-        assert level_1_rate <= tat_store.tats[1][1].count / tat_store.tats[1][1].period_seconds
+        state = throttle.ThrottleState(level=3, tat=now + 3)
+        assert self.gcra._calculate_next_tat(now, state, rate_limit) == now + 3 + rate_limit.inverse
+
+        state = throttle.ThrottleState(level=3, tat=now - 3)
+        assert self.gcra._calculate_next_tat(now, state, rate_limit) == now - 3 + rate_limit.inverse
 
 
-    def test_wrapper(self):
-        time_warp = TimeWarp()
-        rate_limit = throttle.RateLimit(1, datetime.timedelta(minutes=15).total_seconds())
-        tat_store = TATStore(rate_limit=rate_limit, now=time_warp.now)
-        gcra = throttle.GCRA(tat_store=tat_store, sleep_fn=time_warp.sleep)
+def test_simple_single_level():
+    rate_limit_io = RateLimitInterface()
 
-        @gcra.throttle(level=0)
-        def fn(i):
-            i += 1
-            return i
+    throttle_states = [throttle_state_row(level=0, tat=10, allocation=1, id=0)]
+    throttle_state_io = ThrottleStateInterface(throttle_states)
 
-        def fn2(i):
-            i += 1
-            return i
+    time = TimeWarp()
 
-        a = 0
-        a = fn(a)
+    gcra = throttle.GCRA(rate_limit_io, throttle_state_io, time)
 
-        with gcra.throttle():
-            b = 0
-            b = fn2(b)
+    class ThrottleFn:
+        def __init__(self, time: throttle.Time):
+            self.time = time
+            self.log = list()
 
-    def test_timeout(self):
-        time_warp = TimeWarp()
-        rate_limit = throttle.RateLimit(2, 60)
-        tat_store = TATStore(rate_limit=rate_limit, now=time_warp.now)
+        @gcra.throttle()
+        def __call__(self, *args, **kwargs):
+            self.log.append(self.time.time())
+            return None
 
-        allowed_wait = 15  # seconds
-        gcra = throttle.GCRA(tat_store=tat_store, sleep_fn=time_warp.sleep)
+    fn = ThrottleFn(time)
 
-        def fn(i):
-            i += 1
-            return i
+    for _ in range(543):
+        fn()
 
-        a = 0
-        # we should get two unrestricted calls
-        for i in range(2):
-            with gcra.throttle(allowed_wait=allowed_wait):
-                a = fn(a)
+    calc_limit = gcra._calculate_rate_limit(rate_limit_io.rate_limit, throttle_state_io.read()[0], 1)
+    assert calc_limit.count == rate_limit_io.rate_limit.count
+    assert calc_limit.period == rate_limit_io.rate_limit.period
 
-        # now we should have a wait time that exceeds our allowed.
-        with pytest.raises(throttle.ExcessiveWaitTime):
-            with gcra.throttle(allowed_wait=allowed_wait):
-                a = fn(a)
+    dt = fn.log[-1]
+    count = len(fn.log) - 1
+
+    rate_count = rate_limit_io.rate_limit.count
+    rate_period = rate_limit_io.rate_limit.period
+    limit = rate_count / rate_period
+    rate = count/dt
+    assert fn.log[-1] - fn.log[-2] >= rate_period/rate_count
+    assert rate/limit <= 1, f"{rate/limit}, count={count}/{rate_count}, dt={dt}/{rate_period}"
+    assert rate <= limit, f"throttled at {rate:.3f}/second with limit at {limit:.3f}/second"
+    assert rate >= 0.99*limit, f"throttled at {rate:.3f}/second with limit at {limit:.3f}/second"
+
+
+
+def test_multi_level_high_priority():
+    rate_limit_io = RateLimitInterface()
+
+    throttle_states = [throttle_state_row(i, i, 0, 10-i) for i in range(10)]
+    throttle_state_io = ThrottleStateInterface(throttle_states)
+
+    time = TimeWarp()
+
+    gcra = throttle.GCRA(rate_limit_io, throttle_state_io, time)
+
+    class ThrottleFn:
+        def __init__(self, time: throttle.Time):
+            self.time = time
+            self.log = list()
+
+        @gcra.throttle(level=len(throttle_states))
+        def __call__(self, *args, **kwargs):
+            self.log.append(self.time.time())
+            return None
+
+    fn = ThrottleFn(time)
+
+    for _ in range(1000):
+        fn()
+
+    dt = time.time()
+    count = len(fn.log) - 1
+    rate_limit = rate_limit_io.read()
+    rate = count/dt
+    limit = rate_limit.count/rate_limit.period
+    assert rate <= limit, f"throttled at {rate:.3f}/second with limit at {limit:.3f}/second"
+    assert rate >= 0.99*limit, f"throttled at {rate:.3f}/second with limit at {limit:.3f}/second"
+
+    for state in throttle_state_io._db.values():
+        print(state)
+
+
+def test_priority_levels():
+    rate_limit_io = RateLimitInterface()
+
+    throttle_states = [
+        throttle_state_row(level=0, tat=0, allocation=1, id=0),
+        throttle_state_row(level=1, tat=0, allocation=1, id=1),
+        throttle_state_row(level=2, tat=0, allocation=1, id=2),
+        throttle_state_row(level=3, tat=0, allocation=1, id=3),
+    ]
+    throttle_state_io = ThrottleStateInterface(throttle_states)
+
+    time = TimeWarp()
+
+    gcra = throttle.GCRA(rate_limit_io, throttle_state_io, time)
+
+    class ThrottleFn:
+        def __init__(self, time: throttle.Time):
+            self.time = time
+            self.log = list()
+
+        def __call__(self, *args, **kwargs):
+            @gcra.throttle(level=kwargs['level'])
+            def _fn(*args, **kwargs):
+                self.log.append(self.time.time())
+                return None
+            return _fn(*args, **kwargs)
+
+    fn = ThrottleFn(time)
+
+    fn(level=0)
+    print(throttle_state_io._db.values())
+    assert throttle_state_io._db[0].tat > 0
+    assert throttle_state_io._db[1].tat == 0
+    assert throttle_state_io._db[2].tat == 0
+    assert throttle_state_io._db[3].tat == 0
+
+    time.sleep(1)
+    fn(level=1)
+    print(throttle_state_io._db.values())
+    assert throttle_state_io._db[1].tat == throttle_state_io._db[0].tat + 1 > 0
+
+    # for _ in range(1000):
+    #     fn()
+
+    # dt = time.time()
+    # count = len(fn.log) - 1
+    # rate_limit = rate_limit_io.read()
+    # rate = count/dt
+    # limit = rate_limit.count/rate_limit.period
+    # assert rate <= limit, f"throttled at {rate:.3f}/second with limit at {limit:.3f}/second"
+    # assert rate >= 0.99*limit, f"throttled at {rate:.3f}/second with limit at {limit:.3f}/second"
+    #
+    # for state in throttle_state_io._db.values():
+    #     print(state)
+
+
+def test_excessive_wait():
+    rate_limit_io = RateLimitInterface()
+
+    throttle_states = [throttle_state_row(level=0, tat=1e6, id=0, allocation=1)]
+    throttle_state_io = ThrottleStateInterface(throttle_states)
+
+    time = TimeWarp()
+
+    gcra = throttle.GCRA(rate_limit_io, throttle_state_io, time)
+
+    class ThrottleFn:
+        def __init__(self, time: throttle.Time):
+            self.time = time
+            self.log = list()
+
+        @gcra.throttle(allowed_wait=60)
+        def __call__(self, *args, **kwargs):
+            self.log.append(self.time.time())
+            return None
+
+    fn = ThrottleFn(time)
+
+    with pytest.raises(throttle.ExcessiveWaitTime):
+        fn()
