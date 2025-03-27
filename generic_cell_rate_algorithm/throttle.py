@@ -1,19 +1,16 @@
 from abc import ABC, abstractmethod
 from contextlib import contextmanager, nullcontext, AbstractContextManager
-from typing import Any, List, Protocol
+from typing import Any, List, Protocol, Optional
 from dataclasses import dataclass
 
 import math
 
 import time as _time
 
-""" What do we need to store
-TAT: Level, TAT, Allocation
-RateLimit: Count, Period
-"""
 
-
+# How many decimal places does time.time() return?
 TIME_RESOLUTION = 1e7
+
 
 class Time(Protocol): # pragma: nocover
     def time(self) -> float:
@@ -23,26 +20,41 @@ class Time(Protocol): # pragma: nocover
         ...
 
 
-
-@dataclass(frozen=True)
 class RateLimit:
-    count: int
-    period: float
+    def __init__(self, count: int, period: float, usage: int=0):
+        self._count = count
+        self._period = period
+        self.usage = usage
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def period(self) -> float:
+        return self._period
+
+    @property
+    def count_remaining(self) -> int:
+        """ Negative numbers are possible. """
+        return self.count - self.usage
 
     @property
     def inverse(self) -> float:
-        """ Account for time resolution and round up """
-        return math.ceil(TIME_RESOLUTION * self.period/self.count) / TIME_RESOLUTION
+        """ Account for time resolution and round up and don't allow infinite time, period time should be the max """
+        count = max(1, self.count_remaining)
+        return math.ceil(TIME_RESOLUTION * self.period/count) / TIME_RESOLUTION
 
     @property
     def rate(self) -> float:
-        return self.count/self.period
+        """ Requests per 'second' """
+        return self.count_remaining/self.period
 
 
 class RateLimitIO(ABC):  # pragma: nocover
     """ Overall Rate limit """
     @abstractmethod
-    def read(self) -> RateLimit:
+    def read(self) -> RateLimit | List[RateLimit]:
         ...
 
 
@@ -57,7 +69,7 @@ class ThrottleState:
         return self.tat < other.tat
 
     def _new(self, tat: float):
-        data = self.__dict__
+        data = dict(self.__dict__)
         data['tat'] = tat
         return ThrottleState(**data)
 
@@ -90,15 +102,24 @@ class ExcessiveWaitTime(Exception):
 
 
 class GCRA:
-    def __init__(self, rate_limit_io: RateLimitIO, throttle_state_io: ThrottleStateIO, time: Time = _time):
+    def __init__(self, rate_io: RateLimitIO, throttle_io: ThrottleStateIO, time: Time = _time):
 
-        self.rate_limit_io = rate_limit_io
-        self.throttle_state_io = throttle_state_io
+        self.rate_io = rate_io
+        self.throttle_io = throttle_io
         self.time = time
 
-    def _get_global_rate_limit(self) -> RateLimit:
-        """ Allow caching of the rate limit """
-        return self.rate_limit_io.read()
+    def _get_rate_limit(self) -> RateLimit:
+        """ Get the current rate limit """
+        response = self.rate_io.read()
+
+        if isinstance(response, RateLimit):
+            return response
+
+        elif isinstance(response, list) and all(isinstance(r, RateLimit) for r in response):
+            """ Find the RateLimit with the fewest remaining counts """
+            return min(response, key=lambda rl: rl.count_remaining)
+
+        raise ValueError('Unknown response from RateLimitIO.read().  Expected RateLimit or [RateLimit, ...]')
 
     @staticmethod
     def _filter_throttle_states(throttle_state_list: List[ThrottleState], level: int) -> ThrottleState:
@@ -115,7 +136,8 @@ class GCRA:
         # We are assuming that there are not Tats with 0 allocation.
         # If that were the case their next TAT would be float('inf')... which is pointless.
         count = int(max(1.0, global_rate_limit.count * throttle_state.allocation/total_allocation))
-        return RateLimit(count, global_rate_limit.period)
+
+        return RateLimit(count=count, period=global_rate_limit.period, usage=global_rate_limit.usage)
 
     @staticmethod
     def _calculate_next_tat(now: float, throttle_state: ThrottleState, rate_limit: RateLimit) -> float:
@@ -130,12 +152,12 @@ class GCRA:
     def throttle(self, level: int = 0, allowed_wait: float = float('inf')) -> Any:
         # read rate limit
         # considered a relatively static resource that does not require an in_transaction
-        global_rate_limit = self._get_global_rate_limit()
+        rate_limit = self._get_rate_limit()
 
         # allow for an IO transaction context manager for the read/write to TatIO
-        with self.throttle_state_io.transaction_context() as _:
+        with self.throttle_io.transaction_context() as _:
             # read tats, starting our transaction
-            throttle_state_list = self.throttle_state_io.read()
+            throttle_state_list = self.throttle_io.read()
 
             # select the next TAT accessible for our level
             throttle_state = self._filter_throttle_states(throttle_state_list, level)
@@ -148,13 +170,13 @@ class GCRA:
                 raise ExcessiveWaitTime(wait_time, allowed_wait)
 
             total_allocation = self._sum_allocations(throttle_state_list)
-            rate_limit = self._calculate_rate_limit(global_rate_limit, throttle_state, total_allocation)
+            level_rate_limit = self._calculate_rate_limit(rate_limit, throttle_state, total_allocation)
 
-            next_tat = self._calculate_next_tat(now, throttle_state, rate_limit)
+            next_tat = self._calculate_next_tat(now, throttle_state, level_rate_limit)
             next_throttle_state = throttle_state._new(next_tat)
 
             # write the update, ending our transaction
-            self.throttle_state_io.write(throttle_state, next_throttle_state)
+            self.throttle_io.write(throttle_state, next_throttle_state)
 
         # Sleep until our start time
         self.time.sleep(max(0.0, wait_time))
