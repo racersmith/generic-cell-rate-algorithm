@@ -27,7 +27,7 @@ class TestMockEndpoint:
         for _ in range(rate_limit.count):
             fn()
 
-        assert len(endpoint._requests) == rate_limit.count
+        assert len(endpoint.log) == rate_limit.count
         assert endpoint.verify_rolling_period([rate_limit]) is None
         assert endpoint.verify_rolling_period([rate_limit, rate_limit]) is None
 
@@ -80,21 +80,21 @@ class TestMockEndpoint:
 
         assert rate_limit.usage == 0, f"{rate_limit}"
         fn()
-        assert len(endpoint._requests) == 1, f"{endpoint._requests}"
+        assert len(endpoint.log) == 1, f"{endpoint.log}"
         assert rate_limit.usage == 1, f"{rate_limit}"
 
         fn()
         fn()
         fn()
-        assert len(endpoint._requests) == 4, f"{endpoint._requests}"
+        assert len(endpoint.log) == 4, f"{endpoint.log}"
         assert rate_limit.usage == 4, f"{rate_limit}"
 
         time.sleep(2*rate_limit.period)
         fn()
-        print(endpoint._requests)
+        print(endpoint.log)
         print(rate_limit.usage)
-        assert endpoint._requests[-1] == 2*rate_limit.period
-        assert len(endpoint._requests) == 5, f"{endpoint._requests}"
+        assert endpoint.log[-1] == 2 * rate_limit.period
+        assert len(endpoint.log) == 5, f"{endpoint.log}"
         assert rate_limit.usage == 1, f"{rate_limit}"
 
     def test_auto_fixed_valid(self, time):
@@ -111,7 +111,7 @@ class TestMockEndpoint:
                 fn()
 
         except ResourceWarning as e:
-            pytest.fail(f"Too many requests for the period: {e}, {endpoint._requests[-1]}", e)
+            pytest.fail(f"Too many requests for the period: {e}, {endpoint.log[-1]}", e)
 
     def test_auto_fixed_invalid(self, time):
         rate_limit = RateLimit(count=10, period=10)
@@ -129,7 +129,7 @@ class TestMockEndpoint:
         with pytest.raises(ResourceWarning):
             for _ in range(rate_limit.count):
                 fn()
-            assert False, f"{restricted_rate.usage}: {endpoint._requests}"
+            assert False, f"{restricted_rate.usage}: {endpoint.log}"
 
 
 # class TestPriorityFunction:

@@ -155,7 +155,7 @@ class TestGCRA:
             for _ in range(n):
                 system.rate_limited_call(level=0)
 
-            assert len(system.endpoint._requests) == n
+            assert len(system.endpoint.log) == n
         except ResourceWarning as e:
             pytest.fail(f"Limiting was not successful: {e}")
 
@@ -168,7 +168,7 @@ class TestGCRA:
             for _ in range(n):
                 system.rate_limited_call(level=0)
 
-            assert len(system.endpoint._requests) == n
+            assert len(system.endpoint.log) == n
         except ResourceWarning as e:
             pytest.fail(f"Limiting was not successful: {e}")
 
@@ -181,7 +181,7 @@ class TestGCRA:
             for _ in range(n):
                 system.rate_limited_call(level=1)
 
-            assert len(system.endpoint._requests) == 2*n
+            assert len(system.endpoint.log) == 2 * n
         except ResourceWarning as e:
             pytest.fail(f"Limiting was not successful: {e}")
 
@@ -194,7 +194,7 @@ class TestGCRA:
             for _ in range(n):
                 system.rate_limited_call(level=0)
 
-            assert len(system.endpoint._requests) == n
+            assert len(system.endpoint.log) == n
         except ResourceWarning as e:
             rl = system.gcra.rate_io.read()
             pytest.fail(f"Limiting was not successful: {e}, {system.time.time()}:{[r.__dict__ for r in rl]}")
