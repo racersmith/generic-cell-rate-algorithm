@@ -59,6 +59,9 @@ class MockEndpoint:
         else:
             self.verify_rolling_period(self.rate_limit)
 
+    def make_request(self, *args, **kwargs):
+        return self.__call__(*args, **kwargs)
+
     @staticmethod
     def _update_usage(now: float, last_timestamp: float, rate_limit: RateLimit):
         """ Update the rate limit usage and reset the usage when new periods are entered.
@@ -72,7 +75,7 @@ class MockEndpoint:
 
     def verify_fixed_period(self, now, rate_limits):
         """ Verify that if the rate limit usage is reset at fixed intervals that we don't exceed the allowed count """
-        last_timestamp = list([self._requests[-1]] + self._requests)[-2]
+        last_timestamp = list([self.log[-1]] + self.log)[-2]
         for rate_limit in rate_limits:
             self._update_usage(now, last_timestamp, rate_limit)
             if rate_limit.usage > rate_limit.count:
@@ -85,8 +88,8 @@ class MockEndpoint:
     def verify_rolling_period(self, rate_limits):
         """ Verify that in the last period we have not exceeded the count for each rate limit """
         for rate_limit in rate_limits:
-            start_of_period = self._requests[-1] - rate_limit.period
-            n_in_period = np.sum(np.array(self._requests) > start_of_period)
+            start_of_period = self.log[-1] - rate_limit.period
+            n_in_period = np.sum(np.array(self.log) > start_of_period)
             if n_in_period > rate_limit.count:
                 raise ResourceWarning(
                     f"Exceeded requests {n_in_period} of {rate_limit.count} over rolling {rate_limit.period}"
