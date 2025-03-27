@@ -46,14 +46,14 @@ def time():
 class MockEndpoint:
     """ Create a mock endpoint that enforces one or more rate limit policies """
     def __init__(self, time: TimeWarp, rate_limit: RateLimit | List[RateLimit], fixed_period=False):
-        self._requests = list()
+        self.log = list()
         self.time = time
         self.rate_limit = _at_least_1d(rate_limit)
         self.fixed_period = fixed_period
 
     def __call__(self, *args, **kwargs):
         now = self.time.time()
-        self._requests.append(now)
+        self.log.append(now)
         if self.fixed_period:
             self.verify_fixed_period(now, self.rate_limit)
         else:
