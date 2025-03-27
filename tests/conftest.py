@@ -6,8 +6,12 @@ from multiprocessing import Lock
 import pytest
 from typing import List, Any, Callable
 
+import numpy as np
+
 from generic_cell_rate_algorithm import throttle
 from generic_cell_rate_algorithm.throttle import RateLimit
+
+
 
 
 def _at_least_1d(x: Any) -> List[Any]:
@@ -75,10 +79,11 @@ class MockEndpoint:
     def verify_rolling_period(self, rate_limits):
         for rate_limit in rate_limits:
             start_of_period = self._requests[-1] - rate_limit.period
-            within_period = list(filter(lambda time_stamp: time_stamp > start_of_period, self._requests))
-            n = len(within_period)
-            if n > rate_limit.count:
-                raise ResourceWarning(f"Exceeded requests {n} of {rate_limit.count} over rolling {rate_limit.period}")
+            n_in_period = np.sum(np.array(self._requests) > start_of_period)
+            if n_in_period > rate_limit.count:
+                raise ResourceWarning(
+                    f"Exceeded requests {n_in_period} of {rate_limit.count} over rolling {rate_limit.period}"
+                )
 
 
 class PriorityFunction:
@@ -111,8 +116,8 @@ class ThrottleStateInterface(throttle.ThrottleStateIO):
     def write(self, previous: throttle.ThrottleState, new: throttle.ThrottleState):
         self._db[previous.id] = throttle_state_row(**new.__dict__)
 
-    def transaction_context(self) -> AbstractContextManager:
-        return Lock()
+    # def transaction_context(self) -> AbstractContextManager:
+    #     return Lock()
 
 
 @pytest.fixture
@@ -140,15 +145,15 @@ class RateLimitInterface(throttle.RateLimitIO):
 
 @pytest.fixture
 def single_rate_limit_io():
-    rate_limits = throttle.RateLimit(count=600, period=900)
+    rate_limits = throttle.RateLimit(count=60, period=900)
     return RateLimitInterface(rate_limits)
 
 
 @pytest.fixture
 def multi_rate_limit_io():
     rate_limits = [
-        throttle.RateLimit(count=600, period=900),
-        throttle.RateLimit(count=6000, period=86400),
+        throttle.RateLimit(count=60, period=900),
+        throttle.RateLimit(count=600, period=86400),
     ]
     return RateLimitInterface(rate_limits)
 
