@@ -187,7 +187,7 @@ class TestGCRA:
         assert average_rate <= rate_limit.rate, f"Throttled rate too high."
         assert average_rate > 0.95 * rate_limit.rate, f"Throttled rate too low."
 
-        current_wait_time = gcra.get_throttle_state().tat - time.time()
+        current_wait_time = gcra._get_throttle_state().tat - time.time()
         assert current_wait_time > 0
 
         @gcra.throttle(allowed_wait=0.9*current_wait_time)
@@ -244,7 +244,7 @@ class TestGcraMultiRate:
         dt = endpoint.log[count] - endpoint.log[0]
         assert count/dt > sustained_rate.rate, f"Throttle not allowing burst rates."
 
-        current_wait_time = gcra.get_throttle_state().tat - time.time()
+        current_wait_time = gcra._get_throttle_state().tat - time.time()
         assert current_wait_time > 0
 
         @gcra.throttle(allowed_wait=0.9*current_wait_time)

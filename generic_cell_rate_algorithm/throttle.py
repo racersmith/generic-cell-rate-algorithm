@@ -130,6 +130,28 @@ def enforce_single_rate_limit(rate_limit: RateLimit | List[RateLimit]):
     else:
         raise ValueError(f"Expected RateLimitIO.read() to return a RateLimit instance or [RateLimit]")
 
+def get_usage_rate_limit(rate_limit_list: RateLimit | list[RateLimit]) -> RateLimit:
+    """ Get the rate limit which has the lowest remaining count
+    This is the rate limit that will fail first regardless of rate.
+    """
+
+    # Wrap a single rate limit instance in a list as needed
+    if isinstance(rate_limit_list, RateLimit):
+        rate_limit_list = [rate_limit_list]
+
+    if len(rate_limit_list) == 0:
+        raise ValueError("RateLimitIO.read() didn't return any rate limits.")
+
+    elif len(rate_limit_list) == 1:
+        logger.warning(f"RateLimitIO.read() only provided a single rate limit. "
+                       f"Don't use Multi-Rate, use basic GCRA instead.")
+
+    # Verify that each rate limit has usage set
+    if any([rate_limit.usage is None for rate_limit in rate_limit_list]):
+        raise ValueError("You must provide 'usage' information for rate limits in multi-rate.")
+
+    return min(rate_limit_list, key=lambda rate_limit: rate_limit.count_remaining)
+
 
 def filter_throttle_states(throttle_state_list: List[ThrottleState], level: int) -> ThrottleState:
     """ Get the next available TAT that we have access to with the given priority level that has allocation """
@@ -172,34 +194,40 @@ class GCRA:
         self.throttle_io = throttle_io
         self.time = time
 
-    def get_throttle_state(self) -> ThrottleState:
-        throttle_state = self.throttle_io.read()
-        return enforce_single_throttle_state(throttle_state)
+    def _get_throttle_state(self, level: int | None = None) -> ThrottleState:
+        """ Get the single throttle state """
+        response = self.throttle_io.read()
+        return enforce_single_throttle_state(response)
 
-    def get_rate_limit(self):
-        rate_limit = self.rate_io.read()
-        return enforce_single_rate_limit(rate_limit)
+    def _get_rate_limit(self):
+        """ Get the single rate limit """
+        response = self.rate_io.read()
+        return enforce_single_rate_limit(response)
+
+    def _read_write_wait(self, rate_limit: RateLimit, allowed_wait: float, level: int | None=None) -> float:
+        throttle_state = self._get_throttle_state(level)
+
+        now = self.time.time()
+        wait_time = throttle_state.tat - now
+
+        if wait_time > allowed_wait:
+            raise ExcessiveWaitTime(wait_time, allowed_wait)
+
+        next_tat = calculate_next_tat(now, throttle_state, rate_limit)
+        next_throttle_state = throttle_state.new(next_tat)
+
+        # write the update, ending our transaction
+        self.throttle_io.write(throttle_state, next_throttle_state)
+
+        return wait_time
 
     @contextmanager
-    def throttle(self, allowed_wait: float=float('inf')):
-        rate_limit = self.get_rate_limit()
+    def throttle(self, allowed_wait: float=float('inf'), level: int | None=None):
+        rate_limit = self._get_rate_limit()
 
         # allow for an IO transaction context manager for the read/write to TatIO
         with self.throttle_io.transaction_context() as _:
-            # Request the throttle states from the user defined reader.  This starts the R/W transaction
-            throttle_state = self.get_throttle_state()
-
-            now = self.time.time()
-            wait_time = throttle_state.tat - now
-
-            if wait_time > allowed_wait:
-                raise ExcessiveWaitTime(wait_time, allowed_wait)
-
-            next_tat = calculate_next_tat(now, throttle_state, rate_limit)
-            next_throttle_state = throttle_state.new(next_tat)
-
-            # write the update, ending our transaction
-            self.throttle_io.write(throttle_state, next_throttle_state)
+            wait_time = self._read_write_wait(rate_limit=rate_limit, allowed_wait=allowed_wait, level=level)
 
         # Sleep until our start time
         self.time.sleep(max(0.0, wait_time))
@@ -207,6 +235,26 @@ class GCRA:
         # Allow execution of context/wrapped code block
         yield
 
+
+
+class GcraMultiRate(GCRA):
+    """ GCRA that respects multiple rate limits simultaneously.
+    This allows for specific burst and sustained rate limits for instance.
+
+    To take advantage of burst rate limits, it is required for RateLimitIO.read() to read the rate limit
+    with current usage.  Designed for when the API returns usage information that can be utilized.
+    Otherwise, this can not provide any benefit, use a simple GCRA with the rate limit set to the
+    lowest allowed call rate.
+
+    All that is necessary to implement the Multi-Rate version is to resolve which rate-limit to utilize on each call.
+    """
+
+    def _get_rate_limit(self):
+        """ Get the rate limit that is going to fail first, which is just the rate limit with the
+        lowest remaining count.
+        """
+        response = self.rate_io.read()
+        return get_usage_rate_limit(response)
 
 
 class GcraPriority(GCRA):
@@ -219,65 +267,11 @@ class GcraPriority(GCRA):
     all non-zero values.
 
     All that said, throttle states must be provided with level and allocation information.
+
+    To allow priority levels we need to select the correct throttle state for the given level and
+    calculate a temporary, normalized rate limit for TAT calculation.
     """
-    def get_throttle_state(self) -> ThrottleState:
-        ...
-
-    @contextmanager
-    def throttle(self, allowed_wait: float=float('inf'), level: int=0):
-        ...
-
-
-class GcraMultiRate(GCRA):
-    """ GCRA that respects multiple rate limits simultaneously.
-    This allows for specific burst and sustained rate limits for instance.
-
-    To take advantage of burst rate limits, it is required for RateLimitIO.read() to read the rate limit
-    with current usage.  Designed for when the API returns usage information that can be utilized.
-    Otherwise, this can not provide any benefit, use a simple GCRA with the rate limit set to the
-    lowest allowed call rate.
-    """
-
-    def get_rate_limit(self):
-        """ Get the rate limit that is going to fail first, which is just the rate limit with the
-        lowest remaining count
-        """
-        rate_limits = self.rate_io.read()
-
-        if isinstance(rate_limits, RateLimit):
-            logger.warning(f"RateLimitIO.read() only provided a single rate limit. "
-                           f"Don't use Multi-Rate, use basic GCRA instead.")
-            return rate_limits
-
-        if len(rate_limits) == 0:
-            raise ValueError("RateLimitIO.read() didn't return any rate limits.")
-
-        if any([rate_limit.usage is None for rate_limit in rate_limits]):
-            raise ValueError("You must provide 'usage' information for rate limits in multi-rate.")
-
-        return min(rate_limits, key=lambda rate_limit: rate_limit.count_remaining)
-
-    def get_throttle_state(self):
-        throttle_state = self.throttle_io.read()
-        return enforce_single_throttle_state(throttle_state)
-
-
-
-class GcraMultiRatePriority(GCRA):
-    def get_rate_limit(self) -> RateLimit:
-        """ Get the current rate limit """
-        response = self.rate_io.read()
-
-        if isinstance(response, RateLimit):
-            return response
-
-        elif isinstance(response, list) and all(isinstance(r, RateLimit) for r in response):
-            """ Find the RateLimit with the fewest remaining counts """
-            return min(response, key=lambda rl: rl.count_remaining)
-
-        raise ValueError('Unknown response from RateLimitIO.read().  Expected RateLimit or [RateLimit, ...]')
-
-    def get_throttle_state(self, level: int) -> (ThrottleState, float):
+    def _get_throttle_state(self, level: int | None=None) -> ThrottleState:
         """ Get the list of throttle states filter them and get the total allocation """
         throttle_state_list = self.throttle_io.read()
         if isinstance(throttle_state_list, RateLimit):
@@ -288,39 +282,34 @@ class GcraMultiRatePriority(GCRA):
             raise ValueError(f"Unexpected result from ThrottleStateIO.read().  "
                              f"Expected [ThrottleState, ...] not {throttle_state_list}")
 
-
         throttle_state = filter_throttle_states(throttle_state_list, level=level)
         total_allocation = sum_allocations(throttle_state_list)
         return throttle_state, total_allocation
 
-    @contextmanager
-    def throttle(self, allowed_wait: float = float('inf'), level: int = 0) -> Any:
-        # read rate limit
-        # considered a relatively static resource that does not require an in_transaction
-        rate_limit = self.get_rate_limit()
+    def _read_write_wait(self, rate_limit: RateLimit, allowed_wait: float, level: int | None=None) -> float:
+        # read tats, starting our transaction
+        throttle_state, total_allocation = self._get_throttle_state()
 
-        # allow for an IO transaction context manager for the read/write to TatIO
-        with self.throttle_io.transaction_context() as _:
-            # read tats, starting our transaction
-            throttle_state, total_allocation = self.throttle_io.read(level=level)
+        now = self.time.time()
+        wait_time = throttle_state.tat - now
 
-            now = self.time.time()
-            wait_time = throttle_state.tat - now
+        if wait_time > allowed_wait:
+            # Wait time is too long
+            raise ExcessiveWaitTime(wait_time, allowed_wait)
 
-            if wait_time > allowed_wait:
-                # Wait time is too long
-                raise ExcessiveWaitTime(wait_time, allowed_wait)
+        level_rate_limit = normalize_rate_limit(rate_limit, throttle_state, total_allocation)
 
-            level_rate_limit = normalize_rate_limit(rate_limit, throttle_state, total_allocation)
+        next_tat = calculate_next_tat(now, throttle_state, level_rate_limit)
+        next_throttle_state = throttle_state.new(next_tat)
 
-            next_tat = calculate_next_tat(now, throttle_state, level_rate_limit)
-            next_throttle_state = throttle_state.new(next_tat)
+        # write the update, ending our transaction
+        self.throttle_io.write(throttle_state, next_throttle_state)
 
-            # write the update, ending our transaction
-            self.throttle_io.write(throttle_state, next_throttle_state)
+        return wait_time
 
-        # Sleep until our start time
-        self.time.sleep(max(0.0, wait_time))
 
-        # Allow execution of context code block
-        yield
+class GcraMultiRatePriority(GcraPriority, GcraMultiRate):
+    """ Priority and Multi-Rate implementations are non-overlapping so we can just
+    inherit from each individual version.
+    """
+    ...
