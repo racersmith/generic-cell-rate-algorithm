@@ -1,7 +1,7 @@
-from generic_cell_rate_algorithm import throttle
-
 import pytest
+import numpy as np
 
+from generic_cell_rate_algorithm import throttle
 from tests.conftest import ThrottleStateInterface, RateLimitInterface, throttle_state_row, MockEndpoint
 
 
@@ -79,16 +79,9 @@ class TestThrottleState:
         assert states[3].tat == 103
 
 
-class TestGcraMethods:
-    # def __init__(self, time):
-    #     rate_limit_io = RateLimitInterface()
-    #
-    #     throttle_states = [throttle_state_row(0, 0, 0, 1)]
-    #     throttle_state_io = ThrottleStateInterface(throttle_states)
-    #
-    #     self.gcra = throttle.GCRA(rate_limit_io, throttle_state_io, time)
-
+class TestThrottleMethods:
     def test_filter_throttle_states(self):
+        """ Should see the lowest tat at or below the requested level that has non-zero allocation. """
         states = [
             throttle.ThrottleState(level=0, tat=1, allocation=0, id=0),
             throttle.ThrottleState(level=1, tat=3, allocation=1, id=1),
@@ -120,6 +113,11 @@ class TestGcraMethods:
         ]
         assert throttle.sum_allocations(states) == 15
 
+        with pytest.raises(ValueError):
+            throttle.sum_allocations([
+                throttle.ThrottleState(level=3, tat=0, allocation=0, id=3)
+            ])
+
     def test_normalize_rate_limit(self):
         state = throttle.ThrottleState(level=3, tat=0, allocation=100, id=3)
         rate_limit = throttle.RateLimit(count=333, period=10)
@@ -131,10 +129,19 @@ class TestGcraMethods:
         assert throttle.normalize_rate_limit(rate_limit, state, total_allocation=1e9).count == 1
 
         with pytest.raises(ValueError):
+            # try and get a rate limit that has no allocation
             throttle.normalize_rate_limit(
                 rate_limit,
                 throttle.ThrottleState(level=3, tat=0, allocation=0, id=3),
                 total_allocation=1e9)
+
+        with pytest.raises(ValueError):
+            # Try and get a normalized rate limit that is larger
+            throttle.normalize_rate_limit(
+                rate_limit,
+                throttle.ThrottleState(level=3, tat=0, allocation=100, id=3),
+                total_allocation=1
+            )
 
     def test_calculate_next_tat(self):
         rate_limit = throttle.RateLimit(count=1, period=10)
@@ -148,6 +155,53 @@ class TestGcraMethods:
 
         state = throttle.ThrottleState(tat=now - 3)
         assert throttle.calculate_next_tat(now, state, rate_limit) == now + rate_limit.inverse
+
+    def test_get_usage_rate_limit(self):
+        rate = throttle.RateLimit(count=30, period=10, usage=0)
+        assert throttle.get_usage_rate_limit(rate) == rate
+        assert throttle.get_usage_rate_limit([rate]) == rate
+
+        burst = throttle.RateLimit(count=30, period=10, usage=0)
+        sustained = throttle.RateLimit(count=50, period=100, usage=0)
+        rate = throttle.get_usage_rate_limit([burst, sustained])
+        assert rate == burst, f"Expected burst rate"
+
+        sustained.usage = 25
+        rate = throttle.get_usage_rate_limit([burst, sustained])
+        assert rate == sustained, f"Expected sustained rate"
+
+        with pytest.raises(ValueError):
+            # Error when rate limit does not have usage initialized.
+            throttle.get_usage_rate_limit([
+                throttle.RateLimit(count=30, period=10),
+                throttle.RateLimit(count=10, period=20, usage=None),
+            ])
+
+        with pytest.raises(ValueError):
+            throttle.get_usage_rate_limit([])
+
+    def test_enforce_single_rate_limit(self):
+        rate_limit = throttle.RateLimit(count=1, period=10)
+        assert throttle.enforce_single_rate_limit(rate_limit) == rate_limit
+        assert throttle.enforce_single_rate_limit([rate_limit]) == rate_limit
+        assert throttle.enforce_single_rate_limit((rate_limit,)) == rate_limit
+        with pytest.raises(ValueError):
+            throttle.enforce_single_rate_limit([]) == rate_limit
+
+        with pytest.raises(ValueError):
+            throttle.enforce_single_rate_limit({'my limit': rate_limit}) == rate_limit
+
+    def test_enforce_single_throttle_state(self):
+        throttle_state = throttle.ThrottleState(tat=0)
+        assert throttle.enforce_single_throttle_state(throttle_state) == throttle_state
+        assert throttle.enforce_single_throttle_state([throttle_state]) == throttle_state
+        assert throttle.enforce_single_throttle_state((throttle_state, )) == throttle_state
+        with pytest.raises(ValueError):
+            throttle.enforce_single_throttle_state([])
+
+        with pytest.raises(ValueError):
+            throttle.enforce_single_throttle_state({'my state': throttle_state})
+
 
 
 class TestGCRA:
@@ -254,54 +308,84 @@ class TestGcraMultiRate:
         with pytest.raises(throttle.ExcessiveWaitTime):
             impatient_request()
 
-    # def test_single_rate_priority(self, single_rate_limit_io, priority_throttle_state_io):
-    #     system = System(single_rate_limit_io, priority_throttle_state_io, fixed_period=False)
-    #
-    #     n = system.rate_limit.count + 25
-    #
-    #     try:
-    #         for _ in range(n):
-    #             system.rate_limited_call(level=0)
-    #
-    #         assert len(system.endpoint.log) == n
-    #     except ResourceWarning as e:
-    #         pytest.fail(f"Limiting was not successful: {e}")
-    #
-    #     states = priority_throttle_state_io.read()
-    #     next_state = min(states)
-    #     assert next_state.level == 1, f"Throttle should have only used the level=0 priority tat"
-    #     assert next_state.tat == 0, f"Throttle should have only used the level=0 priority tat"
-    #
-    #     try:
-    #         for _ in range(n):
-    #             system.rate_limited_call(level=1)
-    #
-    #         assert len(system.endpoint.log) == 2 * n
-    #     except ResourceWarning as e:
-    #         pytest.fail(f"Limiting was not successful: {e}")
-    #
-    # def test_multi_rate_no_priority(self, multi_rate_limit_io, throttle_state_io):
-    #     system = System(multi_rate_limit_io, throttle_state_io, fixed_period=True)
-    #
-    #     count = max(system.rate_limit, key=lambda rl: rl.count).count
-    #     n = count + 25
-    #     try:
-    #         for _ in range(n):
-    #             system.rate_limited_call(level=0)
-    #
-    #         assert len(system.endpoint.log) == n
-    #     except ResourceWarning as e:
-    #         rl = system.gcra.rate_io.read()
-    #         pytest.fail(f"Limiting was not successful: {e}, {system.time.time()}:{[r.__dict__ for r in rl]}")
-    #
-    # def test_excessive_wait(self, single_rate_limit_io, throttle_state_io):
-    #     system = System(single_rate_limit_io, throttle_state_io, fixed_period=True)
-    #
-    #     n = system.rate_limit.count + 25
-    #     initial_wait = 2 * system.rate_limit.inverse
-    #
-    #     with pytest.raises(throttle.ExcessiveWaitTime):
-    #         for _ in range(n):
-    #             system.rate_limited_call(level=0, allowed_wait=initial_wait)
-    #
-    #     assert system.rate_limit.usage > 1, f"Expected to have some usage, {system.rate_limit.usage}"
+
+class TestGcraPriority:
+    def test_normal(self, time):
+        # mock data
+        rate_limit = throttle.RateLimit(count=600, period=900)
+        throttle_state = [
+            throttle_state_row(id=0, level=0, tat=0, allocation=1),
+            throttle_state_row(id=1, level=1, tat=0, allocation=2),
+        ]
+
+
+        # Build interface to mock db
+        rate_io = RateLimitInterface(rate_limit)
+        throttle_io = ThrottleStateInterface(throttle_state)
+
+        _throttle_io_response = throttle_io.read()
+        assert len(_throttle_io_response) == 2
+        assert throttle.sum_allocations(_throttle_io_response) == 3
+
+        # Initialize our GCRA throttler
+        gcra = throttle.GcraPriority(
+            rate_io=rate_io,
+            throttle_io=throttle_io,
+            time=time
+        )
+
+        # Mock our test endpoint which enforces the rate limit policy provided
+        endpoint = MockEndpoint(time, rate_limit, fixed_period=False)
+
+        # Mock our throttled api call function
+        @gcra.throttle(level=0)
+        def low_priority_api_request():
+            endpoint()
+            return None
+
+        @gcra.throttle(level=1)
+        def high_priority_api_request():
+            endpoint()
+            return None
+
+
+        # Check that high priority requests are serviced faster than low priority
+
+        requests = {
+            'high': {'fn': high_priority_api_request, 'log': list()},
+            'low': {'fn': low_priority_api_request, 'log': list()},
+        }
+
+        choices = list(requests.keys())
+
+        # Run the test
+        try:
+            for _ in range(2*rate_io.get_max_count() + 5):
+                request_type = np.random.choice(choices)
+                request = requests[request_type]
+                request['fn']()
+                if len(endpoint.log) > 1:
+                    dt = endpoint.log[-1] - endpoint.log[-2]
+                    request['log'].append(dt)
+
+        except ResourceWarning as e:
+            pytest.fail(f"Did not correctly limit function: {e}")
+
+        average_rate = (len(endpoint.log)-1)/(endpoint.log[-1]-endpoint.log[0])
+        assert average_rate <= rate_limit.rate, f"Throttled rate too high."
+
+        low_priority_rate = 1 / np.mean(requests['low']['log'])
+        high_priority_rate = 1 / np.mean(requests['high']['log'])
+        assert high_priority_rate > low_priority_rate, (f"Higher priority should have faster requests."
+                                                        f"high: {high_priority_rate:.2e}, low: {low_priority_rate:.2e}")
+
+        # determine the current wait time to trigger an excessive wait error
+        current_wait_time = gcra._get_throttle_state(level=0)[0].tat - time.time()
+        assert current_wait_time > 0, f"Something is amiss, wait times should be positive. {current_wait_time}"
+
+        @gcra.throttle(allowed_wait=0.9*current_wait_time, level=0)
+        def impatient_request():
+            return None
+
+        with pytest.raises(throttle.ExcessiveWaitTime):
+            impatient_request()

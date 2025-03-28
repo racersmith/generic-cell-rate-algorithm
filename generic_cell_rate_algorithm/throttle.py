@@ -29,7 +29,7 @@ class RateLimit:
         self._period = period
         self.usage = usage
 
-    def __str__(self):
+    def __str__(self):  #pragma: nocover
         if self.usage is None:
             return f"RateLimit(count={self.count}, period={self.period})"
         else:
@@ -119,7 +119,7 @@ def enforce_single_throttle_state(throttle_state: ThrottleState | list[ThrottleS
     if isinstance(throttle_state, ThrottleState):
         return throttle_state
 
-    elif isinstance(throttle_state, list) and len(throttle_state) == 1:
+    elif isinstance(throttle_state, (list, tuple)) and len(throttle_state) == 1:
         return throttle_state[0]
 
     else:
@@ -130,7 +130,7 @@ def enforce_single_rate_limit(rate_limit: RateLimit | List[RateLimit]):
     if isinstance(rate_limit, RateLimit):
         return rate_limit
 
-    elif isinstance(rate_limit, list) and len(rate_limit) == 1:
+    elif isinstance(rate_limit, (list, tuple)) and len(rate_limit) == 1:
         return rate_limit[0]
 
     else:
@@ -148,7 +148,7 @@ def get_usage_rate_limit(rate_limit_list: RateLimit | list[RateLimit]) -> RateLi
     if len(rate_limit_list) == 0:
         raise ValueError("RateLimitIO.read() didn't return any rate limits.")
 
-    elif len(rate_limit_list) == 1:
+    elif len(rate_limit_list) == 1:  #progma: nocover
         logger.warning(f"RateLimitIO.read() only provided a single rate limit. "
                        f"Don't use Multi-Rate, use basic GCRA instead.")
 
@@ -170,16 +170,27 @@ def filter_throttle_states(throttle_state_list: List[ThrottleState], level: int)
 
 def sum_allocations(throttle_state_list: List[ThrottleState]) -> float:
     """ Get the total allocation over all tats for normalizing allocations """
-    return sum(throttle_stat.allocation for throttle_stat in throttle_state_list)
+    total = sum(throttle_stat.allocation for throttle_stat in throttle_state_list)
+
+    if total <= 0:
+        raise ValueError("Total allocation must be positive")
+
+    return total
 
 
 def normalize_rate_limit(rate_limit: RateLimit, throttle_state: ThrottleState, total_allocation: float) -> RateLimit:
     """ Calculate the rate limit adjusted to the allocation of the selected throttle_state. """
 
-    if throttle_state.allocation == 0:
-        raise ValueError(f"throttle_stata has an allocation of zero")
+    if throttle_state.allocation <= 0:
+        raise ValueError(f"throttle_state must have a positive allocation.  Given: {throttle_state}")
 
-    count = int(max(1.0, rate_limit.count * throttle_state.allocation/total_allocation))
+    allocation_fraction = throttle_state.allocation/total_allocation
+    if allocation_fraction > 1:
+        raise ValueError(f"throttle_state.allocation={throttle_state.allocation} "
+                         f"is larger than given total_allocation={total_allocation}"
+                         f"If allowed, this would result in a excessive normalized rate limit.")
+
+    count = int(max(1.0, rate_limit.count * allocation_fraction))
 
     return RateLimit(count=count, period=rate_limit.period, usage=rate_limit.usage)
 
@@ -277,12 +288,12 @@ class GcraPriority(GCRA):
     To allow priority levels we need to select the correct throttle state for the given level and
     calculate a temporary, normalized rate limit for TAT calculation.
     """
-    def _get_throttle_state(self, level: int | None=None) -> ThrottleState:
+    def _get_throttle_state(self, level: int | None=None) -> (ThrottleState, float):
         """ Get the list of throttle states filter them and get the total allocation """
         throttle_state_list = self.throttle_io.read()
+
         if isinstance(throttle_state_list, RateLimit):
             throttle_state_list = [throttle_state_list]
-
 
         if not isinstance(throttle_state_list, list):
             raise ValueError(f"Unexpected result from ThrottleStateIO.read().  "
@@ -294,7 +305,7 @@ class GcraPriority(GCRA):
 
     def _read_write_wait(self, rate_limit: RateLimit, allowed_wait: float, level: int | None=None) -> float:
         # read tats, starting our transaction
-        throttle_state, total_allocation = self._get_throttle_state()
+        throttle_state, total_allocation = self._get_throttle_state(level=level)
 
         now = self.time.time()
         wait_time = throttle_state.tat - now
