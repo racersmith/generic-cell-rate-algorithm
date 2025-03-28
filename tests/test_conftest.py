@@ -71,7 +71,7 @@ class TestMockEndpoint:
                 fn()
 
     def test_update_usage(self, time):
-        rate_limit = RateLimit(count=10, period=12)
+        rate_limit = RateLimit(count=10, period=12, usage=0)
 
         endpoint = MockEndpoint(time=time, rate_limit=[rate_limit], fixed_period=True)
         def fn():
@@ -114,10 +114,11 @@ class TestMockEndpoint:
             pytest.fail(f"Too many requests for the period: {e}, {endpoint.log[-1]}", e)
 
     def test_auto_fixed_invalid(self, time):
-        rate_limit = RateLimit(count=10, period=10)
+        rate_limit = RateLimit(count=10, period=10, usage=0)
         restricted_rate = RateLimit(
             count=rate_limit.count - 1, # Restrict the allowed count by 1.
-            period=rate_limit.period
+            period=rate_limit.period,
+            usage=0
         )
 
         endpoint = MockEndpoint(time=time, rate_limit=[rate_limit, restricted_rate], fixed_period=True)
@@ -161,7 +162,7 @@ class TestThrottleStateInterface:
         throttle_state_io = ThrottleStateInterface(throttle_states)
         result = throttle_state_io.read()
         state = result[1]
-        new_state = state._new(99)
+        new_state = state.new(99)
         throttle_state_io.write(state, new_state)
         assert throttle_state_io._db[state.id]._asdict() == new_state.__dict__
 

@@ -50,6 +50,7 @@ class MockEndpoint:
         self.time = time
         self.rate_limit = _at_least_1d(rate_limit)
         self.fixed_period = fixed_period
+        self.period_log = {rate_limit: dict() for rate_limit in self.rate_limit}
 
     def __call__(self, *args, **kwargs):
         now = self.time.time()
@@ -62,27 +63,21 @@ class MockEndpoint:
     def make_request(self, *args, **kwargs):
         return self.__call__(*args, **kwargs)
 
-    @staticmethod
-    def _update_usage(now: float, last_timestamp: float, rate_limit: RateLimit):
-        """ Update the rate limit usage and reset the usage when new periods are entered.
-        This simulates that if an endpoint uses fixed periods for their policy that rest at the start of each period.
-        """
-        if now // rate_limit.period > last_timestamp // rate_limit.period:
-            # The current time is in a different period than the last timestamp.
-            rate_limit.usage = 0
-
-        rate_limit.usage += 1
-
     def verify_fixed_period(self, now, rate_limits):
         """ Verify that if the rate limit usage is reset at fixed intervals that we don't exceed the allowed count """
         last_timestamp = list([self.log[-1]] + self.log)[-2]
         for rate_limit in rate_limits:
-            self._update_usage(now, last_timestamp, rate_limit)
+            period = int(now // rate_limit.period)
+            count = self.period_log[rate_limit].get(period, 0)
+            count += 1
+            self.period_log[rate_limit][period] = count
+            rate_limit.usage = count
+
             if rate_limit.usage > rate_limit.count:
-                current_index = now//rate_limit.period
-                remaining = (current_index + 1) * rate_limit.period - now
+                remaining = (period + 1) * rate_limit.period - now
                 raise ResourceWarning(
-                    f"Exceeded requests {rate_limit.usage} of {rate_limit.count} over fixed {rate_limit.period} {remaining}"
+                    f"Exceeded requests {rate_limit.usage} of {rate_limit.count} "
+                    f"over fixed {rate_limit.period}s with {remaining}s remaining"
                 )
 
     def verify_rolling_period(self, rate_limits):
@@ -103,7 +98,7 @@ class PriorityFunction:
         self.fn = fn
 
     def __call__(self, level: int=0, allowed_wait: float=float('inf')):
-        @self.gcra.throttle(level=level, allowed_wait=allowed_wait)
+        @self.gcra.throttle(allowed_wait=allowed_wait, level=level)
         def wrapper(*args, **kwargs):
             return self.fn(*args, **kwargs)
         return wrapper
@@ -114,8 +109,11 @@ throttle_state_row = namedtuple("throttle_state_row", ["id", "level", "tat", "al
 
 class ThrottleStateInterface(throttle.ThrottleStateIO):
     """ Create a interface to a mock DB for throttle states """
-    def __init__(self, throttle_state_list: List[throttle_state_row]):
-        self._db = {state.id: state for state in throttle_state_list}
+    def __init__(self, throttle_state: throttle_state_row | List[throttle_state_row]):
+        if isinstance(throttle_state, throttle_state_row):
+            throttle_state = [throttle_state]
+
+        self._db = {state.id: state for state in throttle_state}
 
     def read(self) -> List[throttle.ThrottleState]:
         """ Read from our mock DB and provide ThrottleStates"""
@@ -160,44 +158,50 @@ class RateLimitInterface(throttle.RateLimitIO):
     def read(self) -> throttle.RateLimit | List[throttle.RateLimit]:
         return self.rate_limits
 
-
-@pytest.fixture
-def single_rate_limit_io():
-    """ Provide a rate limit interface with a single rate limit """
-    rate_limits = throttle.RateLimit(count=60, period=900)
-    return RateLimitInterface(rate_limits)
-
-
-@pytest.fixture
-def multi_rate_limit_io():
-    """ Provide a rate limit interface with two rate limits. """
-    rate_limits = [
-        throttle.RateLimit(count=60, period=900),
-        throttle.RateLimit(count=600, period=86400),
-    ]
-    return RateLimitInterface(rate_limits)
+    def get_max_count(self):
+        if isinstance(self.rate_limits, throttle.RateLimit):
+            return self.rate_limits.count
+        else:
+            return max(self.rate_limits, key=lambda rate_limit: rate_limit.count).count
 
 
-class System:
-    """ Package a test system together that has everything setup and ready to run """
-    def __init__(self, rate_limit_io, throttle_state_io, fixed_period: bool):
-        self.time = TimeWarp()
-        self.gcra = throttle.GCRA(
-            rate_io=rate_limit_io,
-            throttle_io=throttle_state_io,
-            time=self.time
-        )
-
-        self.fixed_period = fixed_period
-        self.endpoint = MockEndpoint(self.time, self.rate_limit, fixed_period=fixed_period)
-
-    @property
-    def rate_limit(self):
-        return self.gcra.rate_io.read()
-
-    def rate_limited_call(self, level: int=0, allowed_wait: float=float('inf')):
-        @self.gcra.throttle(level=level, allowed_wait=allowed_wait)
-        def _fn():
-            return self.endpoint()
-
-        return _fn()
+# @pytest.fixture
+# def single_rate_limit_io():
+#     """ Provide a rate limit interface with a single rate limit """
+#     rate_limits = throttle.RateLimit(count=60, period=900, usage=0)
+#     return RateLimitInterface(rate_limits)
+#
+#
+# @pytest.fixture
+# def multi_rate_limit_io():
+#     """ Provide a rate limit interface with two rate limits. """
+#     rate_limits = [
+#         throttle.RateLimit(count=60, period=900, usage=0),
+#         throttle.RateLimit(count=600, period=86400, usage=0),
+#     ]
+#     return RateLimitInterface(rate_limits)
+#
+#
+# class System:
+#     """ Package a test system together that has everything setup and ready to run """
+#     def __init__(self, rate_limit_io, throttle_state_io, fixed_period: bool):
+#         self.time = TimeWarp()
+#         self.gcra = throttle.GCRA(
+#             rate_io=rate_limit_io,
+#             throttle_io=throttle_state_io,
+#             time=self.time
+#         )
+#
+#         self.fixed_period = fixed_period
+#         self.endpoint = MockEndpoint(self.time, self.rate_limit, fixed_period=fixed_period)
+#
+#     @property
+#     def rate_limit(self):
+#         return self.gcra.rate_io.read()
+#
+#     def rate_limited_call(self, level: int=0, allowed_wait: float=float('inf')):
+#         @self.gcra.throttle(allowed_wait=allowed_wait, level=level)
+#         def _fn():
+#             return self.endpoint()
+#
+#         return _fn()
