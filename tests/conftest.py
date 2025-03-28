@@ -83,11 +83,14 @@ class MockEndpoint:
     def verify_rolling_period(self, rate_limits):
         """ Verify that in the last period we have not exceeded the count for each rate limit """
         for rate_limit in rate_limits:
-            start_of_period = self.log[-1] - rate_limit.period
-            n_in_period = np.sum(np.array(self.log) > start_of_period)
+            log = np.array(self.log)
+            start_of_period = log[-1] - rate_limit.period
+            in_period = log > start_of_period
+            n_in_period = np.sum(in_period)
             if n_in_period > rate_limit.count:
                 raise ResourceWarning(
                     f"Exceeded requests {n_in_period} of {rate_limit.count} over rolling {rate_limit.period}"
+                    f", {log[in_period][0]} to {log[in_period][-1]}={log[in_period][-1] - log[in_period][0]}"
                 )
 
 
