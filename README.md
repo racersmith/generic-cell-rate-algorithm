@@ -17,6 +17,17 @@ Higher priority levels have access to levels at or below the priority level.  Th
 greedily select the earliest TAT from the store for use.  Each priority level can be given an allocation
 of the total rate limit which is set globally.  
 
-## Smooth Burst to Sustained Throttling
-With the addition of one additional storage attribute, it is possible to create a rate limiting system
-that will smoothly transition between a defined burst limit (count, period) and a sustained limit.
+## Respecting Multiple Rate Limits with Fixed Period Windows
+It is possible to include multiple rate limits and calls will be executed prioritizing burst traffic.  This is 
+best suited for cases where the rate limits are imposed on static windows that are refreshed at the end of each period.
+It is also, assumed that obtaining usage information for the period is possible and can be provided. Without usage
+information, throttling can not take advantage of possible burst overhead and can only fall back to respecting the
+slowest of the given rate limits.
+
+Here is an example of a system with two rate limits imposed, a 600 per 15 minutes and a 6000 per 24 hours.
+The calls were made as fast as the system would allow.
+![Burst Sustained Example](media/multirate_example.png)
+
+With the same rate limits imposed, here is an example with a simulated random request interval.
+![Burst Sustained Simulation Example](media/multirate_simulation_example.png)
+
