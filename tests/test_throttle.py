@@ -180,8 +180,8 @@ class TestGCRA:
         try:
             for _ in range(2*rate_io.get_max_count() + 5):
                 api_request()
-        except ResourceWarning:
-            pytest.fail(f"Did not correctly limit function")
+        except ResourceWarning as e:
+            pytest.fail(f"Did not correctly limit function: {e}")
 
         average_rate = (len(endpoint.log)-1)/(endpoint.log[-1]-endpoint.log[0])
         assert average_rate <= rate_limit.rate, f"Throttled rate too high."
