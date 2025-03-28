@@ -29,6 +29,12 @@ class RateLimit:
         self._period = period
         self.usage = usage
 
+    def __str__(self):
+        if self.usage is None:
+            return f"RateLimit(count={self.count}, period={self.period})"
+        else:
+            return f"RateLimit(count={self.count}, period={self.period}, usage={self.usage})"
+
     @property
     def count(self) -> int:
         return self._count
