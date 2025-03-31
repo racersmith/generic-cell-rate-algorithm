@@ -3,6 +3,7 @@ from generic_cell_rate_algorithm.throttle import (
     ThrottleState,
     RateLimitIO,
     ThrottleStateIO,
+    ExcessiveWaitTime,
 )
 from generic_cell_rate_algorithm.throttle import (
     GCRA,
@@ -20,4 +21,5 @@ __all__ = [
     "GcraMultiRate",
     "GcraPriority",
     "GcraMultiRatePriority",
+    "ExcessiveWaitTime",
 ]
