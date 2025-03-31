@@ -1,6 +1,6 @@
 [project]
 name = "generic-cell-rate-algorithm"
-version = "0.1.0"
+version = "0.1.1"
 description = ""
 authors = [
     {name = "Josh Smith", email = "racersmith@gmail.com"}
